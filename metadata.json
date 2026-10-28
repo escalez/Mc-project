@@ -1,0 +1,6 @@
+{
+  "name": "MC ProxyTier",
+  "description": "MC ProxyTier — بروكسي SOCKS5 مستقل متوافق مع ZeroTier مع تسريع فتح صفحات المايكروتيك للإنترنت الضعيف ومسح الكاش التلقائي",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
