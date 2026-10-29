@@ -9,14 +9,6 @@ import java.io.OutputStream
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 
-/**
- * تطبيق مستقل لبروتوكول ومصافحة البروكسي (Socks5ProtocolEngine implements Socks5HandshakeContract).
- *
- * المزايا الأساسية لإصلاح اتصال بيانات الهاتف + ZeroTier:
- * 1. يفتح سوكيت واحد نظيف فقط لكل محاولة فحص دون فتح سوكيتات مزدوجة أو وهمية.
- * 2. يمنح مصافحة بيانات الهاتف + ZeroTier مهلة كافية (7500ms) حتى يكتمل مسار UDP الخاص بـ ZeroTier.
- * 3. يدعم مصادقة RFC 1929 القياسية + وضع عدم وجود مصادقة (No-Auth) لسيرفرات المايكروتيك.
- */
 class Socks5ProtocolEngine(
     private val socketChannel: SocketChannelContract,
     private val killSwitch: ProxyKillSwitchContract,
@@ -102,8 +94,6 @@ class Socks5ProtocolEngine(
             val ver = try {
                 input.readUnsignedByte()
             } catch (_: Exception) {
-                // Some MikroTik / HTTP proxies wait for the first HTTP request or speak SOCKS4;
-                // TCP 3-way handshake already succeeded on `sock.connect`!
                 val rtt = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
                 return@withContext Result.success(rtt)
             }
@@ -169,9 +159,7 @@ class Socks5ProtocolEngine(
         }
 
         when (chosenMethod) {
-            0x00 -> {
-                // Server accepted No-Auth
-            }
+            0x00 -> Unit
             0x02 -> {
                 if (!cfg.authEnabled || cfg.username.isBlank()) {
                     throw IOException("البروكسي يطلب اسم مستخدم وكلمة مرور (RFC 1929) — قم بتفعيل خيار المصادقة")
@@ -213,8 +201,8 @@ class Socks5ProtocolEngine(
     ) {
         val req = ByteArray(4 + rawAddressBytes.size + 2)
         req[0] = 0x05
-        req[1] = 0x01 // CONNECT
-        req[2] = 0x00 // RSV
+        req[1] = 0x01
+        req[2] = 0x00
         req[3] = atyp.toByte()
         System.arraycopy(rawAddressBytes, 0, req, 4, rawAddressBytes.size)
         val portOffset = 4 + rawAddressBytes.size
@@ -226,7 +214,7 @@ class Socks5ProtocolEngine(
 
         val respVer = upIn.readUnsignedByte()
         val rep = upIn.readUnsignedByte()
-        upIn.readUnsignedByte() // RSV
+        upIn.readUnsignedByte()
         val bndAtyp = upIn.readUnsignedByte()
 
         when (bndAtyp) {

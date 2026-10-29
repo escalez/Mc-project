@@ -4,14 +4,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
 
-/**
- * تطبيق مستقل لنظام قطع اتصال البروكسي وإغلاق السوكيتات (ProxySocketKillSwitch).
- * - يغلق جميع السوكيتات المعلقة عند التحول من وايفاي إلى بيانات الهاتف لمنع بقاء اتصالات ميتة على ZeroTier.
- * - يغلق السوكيتات العادية بـ TCP FIN نظيف حتى لا يحظر سيرفر المايكروتيك عنوان ZeroTier المحلي،
- *   ويستخدم الإغلاق القسري الفوري عند إيقاف البروكسي أو تبديل الشبكة.
- */
 class ProxySocketKillSwitch(
     private val logger: ProxyLogContract = VpnSocketProtector
 ) : ProxyKillSwitchContract {
@@ -19,7 +12,8 @@ class ProxySocketKillSwitch(
     private val trackedSockets: MutableSet<Socket> =
         Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
 
-    private val serverSocketRef = AtomicReference<ServerSocket?>(null)
+    private val trackedServerSockets: MutableSet<ServerSocket> =
+        Collections.newSetFromMap(ConcurrentHashMap<ServerSocket, Boolean>())
 
     override fun trackSocket(socket: Socket?): Socket? {
         if (socket != null) {
@@ -35,11 +29,13 @@ class ProxySocketKillSwitch(
     }
 
     override fun attachServerSocket(server: ServerSocket?) {
-        val prev = serverSocketRef.getAndSet(server)
-        if (prev != null && prev !== server) {
-            try {
-                prev.close()
-            } catch (_: Exception) {
+        if (server != null) {
+            trackedServerSockets.add(server)
+        } else {
+            val servers = trackedServerSockets.toList()
+            trackedServerSockets.clear()
+            for (srv in servers) {
+                try { srv.close() } catch (_: Exception) {}
             }
         }
     }
@@ -71,12 +67,15 @@ class ProxySocketKillSwitch(
     override fun killAllSocketsNow(reasonTag: String, logIfKilled: Boolean): Int {
         var killedCount = 0
 
-        val srv = serverSocketRef.getAndSet(null)
-        if (srv != null && !srv.isClosed) {
-            try {
-                srv.close()
-                killedCount++
-            } catch (_: Exception) {
+        val servers = trackedServerSockets.toList()
+        trackedServerSockets.clear()
+        for (srv in servers) {
+            if (!srv.isClosed) {
+                try {
+                    srv.close()
+                    killedCount++
+                } catch (_: Exception) {
+                }
             }
         }
 
@@ -104,21 +103,12 @@ class ProxySocketKillSwitch(
     private fun gracefulCloseSingleSocket(sock: Socket) {
         try {
             if (!sock.isClosed && sock.isConnected) {
-                try {
-                    sock.shutdownOutput()
-                } catch (_: Exception) {
-                }
-                try {
-                    sock.shutdownInput()
-                } catch (_: Exception) {
-                }
+                try { sock.shutdownOutput() } catch (_: Exception) {}
+                try { sock.shutdownInput() } catch (_: Exception) {}
             }
         } catch (_: Exception) {
         }
-        try {
-            sock.close()
-        } catch (_: Exception) {
-        }
+        try { sock.close() } catch (_: Exception) {}
     }
 
     private fun forceCloseSingleSocket(sock: Socket) {
@@ -128,9 +118,6 @@ class ProxySocketKillSwitch(
             }
         } catch (_: Exception) {
         }
-        try {
-            sock.close()
-        } catch (_: Exception) {
-        }
+        try { sock.close() } catch (_: Exception) {}
     }
 }

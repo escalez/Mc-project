@@ -5,10 +5,6 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
-/**
- * ProxyPreferencesRepository (implements ProxyPreferencesContract)
- * Persists multiple saved SOCKS5 proxy profiles, the selected proxy ID, and saved router IPs with cache stats.
- */
 class ProxyPreferencesRepository(context: Context) : ProxyPreferencesContract {
 
     private val prefs: SharedPreferences =
@@ -132,33 +128,25 @@ class ProxyPreferencesRepository(context: Context) : ProxyPreferencesContract {
         prefs.edit().putString(KEY_SAVED_PROXIES_JSON, arr.toString()).apply()
     }
 
-    override fun loadSelectedProxyId(): String? {
-        return prefs.getString(KEY_SELECTED_PROXY_ID, null)
-    }
+    override fun loadSelectedProxyId(): String? = prefs.getString(KEY_SELECTED_PROXY_ID, null)
 
     override fun saveSelectedProxyId(id: String?) {
         prefs.edit().putString(KEY_SELECTED_PROXY_ID, id).apply()
     }
 
-    override fun loadQuickIp(): String {
-        return prefs.getString(KEY_QUICK_IP, "") ?: ""
-    }
+    override fun loadQuickIp(): String = prefs.getString(KEY_QUICK_IP, "") ?: ""
 
     override fun saveQuickIp(ip: String) {
         prefs.edit().putString(KEY_QUICK_IP, ip.trim()).apply()
     }
 
-    override fun loadWeakNetTurboEnabled(): Boolean {
-        return prefs.getBoolean(KEY_WEAK_NET_TURBO, true)
-    }
+    override fun loadWeakNetTurboEnabled(): Boolean = prefs.getBoolean(KEY_WEAK_NET_TURBO, true)
 
     override fun saveWeakNetTurboEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_WEAK_NET_TURBO, enabled).apply()
     }
 
-    override fun loadInternalDnsEnabled(): Boolean {
-        return prefs.getBoolean(KEY_INTERNAL_DNS_ENABLED, true)
-    }
+    override fun loadInternalDnsEnabled(): Boolean = prefs.getBoolean(KEY_INTERNAL_DNS_ENABLED, true)
 
     override fun saveInternalDnsEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_INTERNAL_DNS_ENABLED, enabled).apply()

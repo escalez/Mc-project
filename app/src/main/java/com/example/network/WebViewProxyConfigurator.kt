@@ -7,37 +7,22 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.Executor
 import kotlin.coroutines.resume
 
-/**
- * WebViewProxyConfigurator (FoxyProxy-Equivalent Native SOCKS5 Mode)
- * ------------------------------------------------------------------
- * Configures Android's Chromium `ProxyController` to route traffic through our local
- * `LocalSocksAuthRelay` (`127.0.0.1:localPort`) using native `socks5://127.0.0.1:localPort`
- * as the primary transport (identical to Firefox + FoxyProxy), with HTTP/CONNECT as fallback.
- *
- * Why `socks5://` primary rule makes router pages load dramatically faster on Mobile Data + ZeroTier:
- * - Chromium WebView treats a SOCKS5 tunnel as a persistent transport-layer TCP connection to the
- *   router IP (`192.168.x.x`, `10.x.x.x`, `11.11.x.x`, `172.x.x.x`).
- * - Chromium's native HTTP/1.1 Keep-Alive connection pool reuses the same open SOCKS5 socket for all
- *   20-35 MikroTik WebFig JS/CSS/image/AJAX requests instead of opening a new TCP + SOCKS5 connection
- *   for every single file!
- */
 object WebViewProxyConfigurator : WebViewProxyContract {
 
     private val directExecutor = Executor { command -> command.run() }
 
     @Volatile
-    private var lastAppliedPort: Int = -1
+    private var lastAppliedEndpoint: String = ""
 
     override fun isProxyOverrideSupported(): Boolean {
         return WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)
     }
 
-    /**
-     * Applies `ProxyController` override pointing to `socks5://127.0.0.1:localPort` (primary)
-     * and `127.0.0.1:localPort` (fallback) without any local-subnet bypass rules so all private
-     * ZeroTier / MikroTik IPs are routed through the pre-warmed SOCKS5 tunnel.
-     */
-    override suspend fun applyLocalRelayProxy(localPort: Int, forceReapply: Boolean): Result<String> =
+    override suspend fun applyLocalRelayProxy(
+        localPort: Int,
+        forceReapply: Boolean,
+        localHost: String
+    ): Result<String> =
         suspendCancellableCoroutine { cont ->
             if (!isProxyOverrideSupported()) {
                 val msg = "جهاز الأندرويد الحالي لا يدعم WebViewFeature.PROXY_OVERRIDE"
@@ -46,17 +31,19 @@ object WebViewProxyConfigurator : WebViewProxyContract {
                 return@suspendCancellableCoroutine
             }
 
-            // Avoid resetting Chromium's active Keep-Alive socket pool if the same relay port is already applied
-            if (!forceReapply && lastAppliedPort == localPort) {
+            val cleanHost = localHost.trim().ifEmpty { "127.0.0.1" }
+            val endpointKey = "$cleanHost:$localPort"
+
+            if (!forceReapply && lastAppliedEndpoint == endpointKey) {
                 if (cont.isActive) {
-                    cont.resume(Result.success("ProxyController مربوط مسبقاً على 127.0.0.1:$localPort"))
+                    cont.resume(Result.success("ProxyController مربوط مسبقاً على $endpointKey"))
                 }
                 return@suspendCancellableCoroutine
             }
 
             try {
-                val socks5RelayRule = "socks5://127.0.0.1:$localPort"
-                val httpRelayRule = "127.0.0.1:$localPort"
+                val socks5RelayRule = "socks5://$cleanHost:$localPort"
+                val httpRelayRule = "$cleanHost:$localPort"
 
                 val proxyConfig = ProxyConfig.Builder()
                     .addProxyRule(socks5RelayRule)
@@ -67,8 +54,8 @@ object WebViewProxyConfigurator : WebViewProxyContract {
                     proxyConfig,
                     directExecutor
                 ) {
-                    lastAppliedPort = localPort
-                    val msg = "تم تفعيل نفق SOCKS5 السريع (FoxyProxy Mode) على 127.0.0.1:$localPort"
+                    lastAppliedEndpoint = endpointKey
+                    val msg = "تم تفعيل نفق SOCKS5 السريع على الآيبي المحلي المخصص $endpointKey"
                     VpnSocketProtector.log("WEBVIEW-PROXY", msg, LogLevel.SUCCESS)
                     if (cont.isActive) {
                         cont.resume(Result.success(msg))
@@ -85,7 +72,7 @@ object WebViewProxyConfigurator : WebViewProxyContract {
 
     override suspend fun clearProxyOverride(): Result<Unit> =
         suspendCancellableCoroutine { cont ->
-            lastAppliedPort = -1
+            lastAppliedEndpoint = ""
             if (!isProxyOverrideSupported()) {
                 if (cont.isActive) cont.resume(Result.success(Unit))
                 return@suspendCancellableCoroutine

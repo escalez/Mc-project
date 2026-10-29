@@ -111,10 +111,6 @@ private data class HttpAuthChallenge(
     val handler: HttpAuthHandler
 )
 
-/**
- * Manual cache wipe helper (ONLY invoked when the user explicitly clicks a manual clear cache button,
- * NEVER called automatically when exiting the WebView!).
- */
 fun clearAllRouterPageCacheAndSession(context: Context, webView: WebView?) {
     try {
         webView?.stopLoading()
@@ -149,11 +145,6 @@ fun clearAllRouterPageCacheAndSession(context: Context, webView: WebView?) {
     )
 }
 
-/**
- * FoxyProxy-Speed HTTP Keep-Alive & Compression Headers:
- * Uses `Connection: keep-alive` and `Accept-Encoding: gzip, deflate` so MikroTik WebFig scripts
- * and HTML compress by ~75% over Mobile Data and reuse the same persistent SOCKS5 socket.
- */
 private fun buildTurboRequestHeaders(turboEnabled: Boolean): Map<String, String> =
     if (turboEnabled) {
         mapOf(
@@ -166,9 +157,6 @@ private fun buildTurboRequestHeaders(turboEnabled: Boolean): Map<String, String>
         )
     }
 
-/**
- * Blocks external internet analytics/font CDNs that hang when browsing a private router over Mobile Data.
- */
 private fun shouldShortCircuitExternalTrackers(requestUrl: String, mainRouterHost: String): Boolean {
     val lower = requestUrl.lowercase()
     val blockedExternalDomains = listOf(
@@ -222,7 +210,6 @@ fun QuickRouterBrowserDialog(
         }
     }
 
-    // Warm the disk vault for this IP into RAM immediately on open so cached images load in 0.0ms
     val initialStats = remember(activeIpKey) {
         RouterIpCacheVault.warmIpCacheIntoRam(context, activeIpKey)
     }
@@ -234,7 +221,6 @@ fun QuickRouterBrowserDialog(
         initialStats.cachedImagesCount > 0 || initialStats.cachedFilesCount > 0
     }
 
-    // Thread-safe flags accessed inside WebViewClient's background IO thread (`shouldInterceptRequest`)
     val turboAtomicFlag = remember { AtomicBoolean(weakNetTurboEnabled) }
     LaunchedEffect(weakNetTurboEnabled) {
         turboAtomicFlag.set(weakNetTurboEnabled)
@@ -245,7 +231,6 @@ fun QuickRouterBrowserDialog(
             ?: socksConfig.localRelayPort
     }
 
-    // IMPORTANT: Closing the WebView preserves all saved cache & images (NO auto-wipe on exit!)
     val closePreservingCache = {
         try {
             webViewRef?.stopLoading()
@@ -281,7 +266,6 @@ fun QuickRouterBrowserDialog(
                 color = CyberObsidian
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    // Top Router Telemetry, Saved Cache Status & Turbo Bar
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -368,7 +352,6 @@ fun QuickRouterBrowserDialog(
 
                         Spacer(modifier = Modifier.height(6.dp))
 
-                        // Speed / Weak-Internet Mode + Manual Cache Refresh Button
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -478,7 +461,6 @@ fun QuickRouterBrowserDialog(
 
                         Spacer(modifier = Modifier.height(6.dp))
 
-                        // URL / IP Input & Navigation Controls Row
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
@@ -590,7 +572,6 @@ fun QuickRouterBrowserDialog(
                         }
                     }
 
-                    // Loading Progress Indicator
                     AnimatedVisibility(visible = isLoading) {
                         LinearProgressIndicator(
                             progress = { (loadProgress / 100f).coerceIn(0.05f, 1f) },
@@ -602,7 +583,6 @@ fun QuickRouterBrowserDialog(
                         )
                     }
 
-                    // Main WebView Container
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -621,8 +601,6 @@ fun QuickRouterBrowserDialog(
                                     )
                                     setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
-                                    // DO NOT clearCache on start or exit! Keep persistent disk & RAM cache intact
-                                    // so router images and WebFig assets load instantaneously across sessions.
                                     settings.apply {
                                         javaScriptEnabled = true
                                         domStorageEnabled = true
@@ -635,7 +613,6 @@ fun QuickRouterBrowserDialog(
                                         displayZoomControls = false
                                         setSupportZoom(true)
                                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                                        // If this IP already has saved cache, prefer local cache first for 0ms load!
                                         cacheMode = if (loadedFromSavedCache) {
                                             WebSettings.LOAD_CACHE_ELSE_NETWORK
                                         } else {
@@ -682,7 +659,6 @@ fun QuickRouterBrowserDialog(
                                                 }
                                             }
 
-                                            // Persistent Router IP Image & Static Asset Vault (0ms Cache Hit or Auto-Save!)
                                             if (!request.isForMainFrame && currentRouterKey.isNotEmpty()) {
                                                 val vaultResponse = RouterIpCacheVault.interceptOrFetchAndCache(
                                                     context = ctx.applicationContext,
@@ -725,7 +701,6 @@ fun QuickRouterBrowserDialog(
                                         override fun onPageCommitVisible(view: WebView?, url: String?) {
                                             super.onPageCommitVisible(view, url)
                                             if (turboAtomicFlag.get()) {
-                                                // Disable heavy CSS animations/transitions so router UI & images appear instantly
                                                 view?.evaluateJavascript(
                                                     "(function(){try{var s=document.createElement('style');s.innerHTML='*,*::before,*::after{transition-duration:0s !important;animation-duration:0s !important;} img{content-visibility:auto;}';document.head.appendChild(s);}catch(e){}})();",
                                                     null
@@ -817,7 +792,6 @@ fun QuickRouterBrowserDialog(
                         )
                     }
 
-                    // Bottom Live Cache Vault Counter & Persistent Cache Status Footer inside Browser
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -851,7 +825,6 @@ fun QuickRouterBrowserDialog(
                 }
             }
 
-            // Router HTTP Basic Auth Modal if prompted by device
             httpAuthChallenge?.let { challenge ->
                 var routerUser by remember { mutableStateOf("admin") }
                 var routerPass by remember { mutableStateOf("") }
@@ -920,7 +893,6 @@ fun QuickRouterBrowserDialog(
     DisposableEffect(Unit) {
         onDispose {
             try {
-                // Stop loading and flush cookies, NEVER wipe the saved cache on exit!
                 webViewRef?.stopLoading()
                 CookieManager.getInstance().flush()
                 webViewRef?.destroy()

@@ -10,10 +10,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * تطبيق واجهة السجل والإحصائيات (VpnSocketProtector implements ProxyLogContract).
- * يستخدم عدادات ذرية (Lock-Free AtomicLong) مع تحديث كل 600ms لمنع أي ثقل أو حرارة بالهاتف.
- */
 object VpnSocketProtector : ProxyLogContract {
 
     private val totalSentBytes = AtomicLong(0L)

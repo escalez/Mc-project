@@ -34,18 +34,14 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 
 data class MainUiState(
-    // Form state for adding a new proxy or editing an existing proxy (starts completely empty!)
     val formNameInput: String = "",
     val socksConfig: Socks5Config = Socks5Config(),
     val editingProxyId: String? = null,
-    // Saved proxies list & strict single-active-proxy lock
     val savedProxies: List<SavedProxyProfile> = emptyList(),
     val activeRunningProxyId: String? = null,
     val selectedProxyId: String? = null,
     val routingMode: RoutingMode = RoutingMode.STANDALONE_PROXY_ZEROTIER,
-    // Saved Router IPs with their persistent image/asset cache (deduplicated by normalizedKey!)
     val savedRouterIps: List<SavedRouterIpEntry> = emptyList(),
-    // MikroTik / Page opener input (starts completely empty!)
     val quickIpInput: String = "",
     val activeBrowserUrl: String? = null,
     val weakNetTurboEnabled: Boolean = true,
@@ -55,15 +51,9 @@ data class MainUiState(
     val handshakeBannerSuccess: Boolean = true,
     val snackbarMessage: String? = null
 ) {
-    /**
-     * Returns ONLY the currently running proxy profile (or null if proxy is stopped).
-     */
     val activeProxyProfile: SavedProxyProfile?
         get() = savedProxies.find { it.id == activeRunningProxyId }
 
-    /**
-     * Returns the selected or first saved proxy profile for quick starting/testing.
-     */
     val selectedOrFirstProfile: SavedProxyProfile?
         get() = savedProxies.find { it.id == activeRunningProxyId }
             ?: savedProxies.find { it.id == selectedProxyId }
@@ -124,7 +114,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState = MutableStateFlow(
             MainUiState(
                 formNameInput = "",
-                socksConfig = Socks5Config(), // Empty IP & Port inputs by default
+                socksConfig = Socks5Config(),
                 editingProxyId = null,
                 savedProxies = initialSaved,
                 activeRunningProxyId = null,
@@ -144,7 +134,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        // Ensure WebView starts in direct connection mode (no stale proxy override) until user manually starts a proxy
         viewModelScope.launch {
             WebViewProxyConfigurator.clearProxyOverride()
         }
@@ -197,9 +186,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Loads a saved proxy into the form so the user can edit it and save changes.
-     */
     fun startEditingProxy(profile: SavedProxyProfile) {
         _uiState.update {
             it.copy(
@@ -212,9 +198,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Cancels editing and resets the form fields to completely empty strings.
-     */
     fun cancelEditingOrClearForm() {
         _uiState.update {
             it.copy(
@@ -226,10 +209,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Saves a new proxy to the saved list OR saves edits to an existing proxy (`editingProxyId`).
-     * Clears the input fields after saving so they remain empty as requested.
-     */
     fun saveProxyToProfileList(startImmediately: Boolean = false) {
         val state = _uiState.value
         val cfg = state.socksConfig
@@ -322,9 +301,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Deletes a saved proxy. If it was currently running, stops it first.
-     */
     fun deleteSavedProxy(profile: SavedProxyProfile) {
         val state = _uiState.value
         val wasRunning = state.activeRunningProxyId == profile.id
@@ -352,9 +328,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Strict Mutual-Exclusion & Zero-Fake-Connection Proxy Starter.
-     */
     fun startSavedProxy(profile: SavedProxyProfile) {
         val previousJob = proxyControlJob
         previousJob?.cancel()
@@ -398,7 +371,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (!isActive || _uiState.value.activeRunningProxyId != profile.id) return@launch
 
             val relayResult = localRelay.startRelay(config = cfg)
-            val boundPort = relayResult.getOrElse { err ->
+            relayResult.getOrElse { err ->
                 if (_uiState.value.activeRunningProxyId == profile.id) {
                     _uiState.update {
                         it.copy(
@@ -420,16 +393,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val sessionBeforeVerify = localRelay.currentSessionId()
 
-            // Verify real upstream proxy reachability BEFORE claiming CONNECTED (No Fake Connection!)
-            // Uses generous 7500ms timeout on Mobile Data + ZeroTier so UDP tunnel punch-through completes cleanly.
             val handshakeCheck = localRelay.verifyUpstreamConnectionWithRetry(
                 config = cfg,
-                maxAttempts = 3,
-                perAttemptTimeoutMs = 7_500,
-                retryDelayMs = 450L
+                maxAttempts = 2,
+                perAttemptTimeoutMs = 4_200,
+                retryDelayMs = 350L
             )
 
-            // Guard: if the user clicked Stop while handshake verification was running, exit immediately
             if (!isActive ||
                 _uiState.value.activeRunningProxyId != profile.id ||
                 !localRelay.isRelayActive() ||
@@ -440,7 +410,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             handshakeCheck.fold(
                 onSuccess = { rtt ->
-                    WebViewProxyConfigurator.applyLocalRelayProxy(boundPort)
+                    val activeHost = localRelay.activeLocalBindHost
+                    val activePort = localRelay.boundPort
+                    val activeBindAddr = "$activeHost:$activePort"
+                    WebViewProxyConfigurator.applyLocalRelayProxy(
+                        localPort = activePort,
+                        forceReapply = true,
+                        localHost = activeHost
+                    )
                     val activeChan = localRelay.currentSocketChannel()
 
                     VpnSocketProtector.updateTelemetry {
@@ -449,66 +426,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             activeMode = RoutingMode.STANDALONE_PROXY_ZEROTIER,
                             activeSocketChannel = activeChan,
                             localRelayRunning = true,
-                            localRelayBindAddress = "127.0.0.1:$boundPort",
+                            localRelayBindAddress = activeBindAddr,
+                            wifiLocalRelayAddress = localRelay.wifiLocalBindAddress,
+                            cellularLocalRelayAddress = localRelay.cellularLocalBindAddress,
                             lastWatchdogPingMs = rtt,
                             watchdogHealthy = true,
-                            statusDetail = "متصل فعلياً: ${profile.displayTitle} (${rtt}ms) عبر [${activeChan.labelAr}]"
+                            statusDetail = "متصل فعلياً: ${profile.displayTitle} (${rtt}ms) عبر [${activeChan.shortBadge}]"
                         )
                     }
 
                     VpnSocketProtector.log(
                         "PROXY-CONNECTED",
-                        "تم الاتصال الفعلي بالبروكسي ${profile.displayTitle} (${rtt}ms) عبر [${activeChan.labelAr}]",
+                        "تم الاتصال الفعلي بالبروكسي ${profile.displayTitle} (${rtt}ms) (${activeChan.labelAr})",
                         LogLevel.SUCCESS
                     )
 
                     val switchNotice = if (previousRunningId != null && previousRunningId != profile.id) {
-                        "تم إيقاف البروكسي السابق والاتصال الفعلي بـ (${profile.displayTitle}) — ${rtt}ms"
+                        "تم إيقاف البروكسي السابق والاتصال الفعلي بـ (${profile.displayTitle}) عبر [${activeChan.shortBadge}] — ${rtt}ms"
                     } else {
-                        "تم الاتصال الفعلي بالبروكسي (${profile.displayTitle}) بنجاح — ${rtt}ms"
+                        "تم الاتصال الفعلي بالبروكسي (${profile.displayTitle}) عبر [${activeChan.shortBadge}] — ${rtt}ms"
                     }
 
                     _uiState.update {
                         it.copy(snackbarMessage = switchNotice)
                     }
                 },
-                onFailure = { err ->
-                    localRelay.stopRelay()
-                    WebViewProxyConfigurator.clearProxyOverride()
+                onFailure = {
+                    val activeHost = localRelay.activeLocalBindHost
+                    val activePort = localRelay.boundPort
+                    val activeBindAddr = "$activeHost:$activePort"
+                    val activeChan = localRelay.currentSocketChannel()
 
-                    val errDetail = err.localizedMessage ?: "تأكد من تشغيل ZeroTier وصحة عنوان البروكسي"
-                    VpnSocketProtector.log(
-                        "FAKE-CONN-GUARD",
-                        "منع الاتصال الوهمي: فشل الوصول إلى البروكسي (${profile.displayTitle}) — تم قطع السوكيت بالكامل ($errDetail)",
-                        LogLevel.ERROR
+                    WebViewProxyConfigurator.applyLocalRelayProxy(
+                        localPort = activePort,
+                        forceReapply = true,
+                        localHost = activeHost
                     )
 
-                    _uiState.update {
-                        it.copy(
-                            activeRunningProxyId = null,
-                            snackbarMessage = "فشل الاتصال بالبروكسي (${profile.displayTitle}) — تأكد من اتصال ZeroTier"
-                        )
-                    }
+                    VpnSocketProtector.log(
+                        "AUTO-RECONNECT",
+                        "بدء حلقة الربط التلقائي الذكي في الخلفية للبروكسي (${profile.displayTitle}) عبر [${activeChan.shortBadge}] حتى يكتمل مسار ZeroTier",
+                        LogLevel.INFO
+                    )
 
                     VpnSocketProtector.updateTelemetry {
                         it.copy(
-                            status = ConnectionStatus.ERROR,
-                            localRelayRunning = false,
-                            activeSocketChannel = ActiveSocketChannel.STANDBY,
-                            activeConnections = 0,
+                            status = ConnectionStatus.RECONNECTING,
+                            activeMode = RoutingMode.STANDALONE_PROXY_ZEROTIER,
+                            activeSocketChannel = activeChan,
+                            localRelayRunning = true,
+                            localRelayBindAddress = activeBindAddr,
+                            wifiLocalRelayAddress = localRelay.wifiLocalBindAddress,
+                            cellularLocalRelayAddress = localRelay.cellularLocalBindAddress,
                             watchdogHealthy = false,
                             lastWatchdogPingMs = -1L,
-                            statusDetail = "فشل الاتصال بالبروكسي (${profile.displayTitle}) — تم منع الاتصال الوهمي وإغلاق السوكيت"
+                            statusDetail = "جاري الربط التلقائي الذكي بـ (${profile.displayTitle}) عبر [${activeChan.shortBadge}] فور جاهزية مسار ZeroTier..."
                         )
                     }
+
+                    _uiState.update {
+                        it.copy(
+                            snackbarMessage = "تم تفعيل الربط التلقائي الذكي عبر (${activeChan.shortBadge}) — سيرتبط تلقائياً فور جاهزية مسار ZeroTier ⚡"
+                        )
+                    }
+
+                    localRelay.startBackgroundAutoReconnect(
+                        config = cfg,
+                        reasonTag = "AUTO-RECONNECT"
+                    )
                 }
             )
         }
     }
 
-    /**
-     * Toggles a specific saved proxy.
-     */
     fun toggleSavedProxy(profile: SavedProxyProfile) {
         val isThisRunningOrConnecting = _uiState.value.activeRunningProxyId == profile.id &&
             (telemetry.value.status == ConnectionStatus.CONNECTED ||
@@ -522,10 +512,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Master header button: starts the currently selected proxy (or saves & starts form if valid),
-     * or stops the currently running proxy.
-     */
     fun startTunnelEngine() {
         val state = _uiState.value
         if (state.socksConfig.isValid) {
@@ -542,9 +528,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Strict Proxy Kill-Switch (`إيقاف البروكسي وقطع السوكيت بالكامل`).
-     */
     fun stopTunnelEngine() {
         val stoppedProfile = _uiState.value.activeProxyProfile
 
@@ -647,13 +630,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefsRepo.saveQuickIp(ip)
     }
 
-    /**
-     * Registers or updates an opened Router IP in `savedRouterIps` with strict deduplication by `normalizedKey`:
-     * - If the IP (`normalizedKey`) ALREADY EXISTS in `savedRouterIps`:
-     *   It is NEVER duplicated! Instead, its saved cache is warmed into RAM and its existing entry is updated.
-     * - If the IP is NEW:
-     *   It is added once to `savedRouterIps` and persisted.
-     */
     private fun upsertSavedRouterIp(
         rawIpOrUrl: String,
         pageTitle: String = "",
@@ -663,7 +639,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (normalizedKey.isEmpty()) {
             return _uiState.value.savedRouterIps to false
         }
-        // Always store ONLY the clean root IP URL ("http://<ip>") without any subpaths or fragments
         val cleanRootUrl = RouterIpCacheVault.normalizeFullUrl(normalizedKey)
         val stats = RouterIpCacheVault.warmIpCacheIntoRam(appCtx, normalizedKey)
         val now = System.currentTimeMillis()
@@ -718,14 +693,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return updatedList to alreadyExisted
     }
 
-    /**
-     * Opens the in-app router web browser:
-     * - Extracts ONLY the clean IP (`normalizedKey`) without any sub-paths or `http://` prefix for the input field.
-     * - Automatically checks if the IP is already in `savedRouterIps`:
-     *   - If already saved: pulls its saved cache into RAM and opens it immediately WITHOUT duplicating it!
-     *   - If new: saves it to `savedRouterIps` and caches its images/assets as it loads.
-     * - NEVER automatically turns on the proxy if the proxy is currently OFF!
-     */
     fun openQuickBrowser(targetIpOrUrl: String = _uiState.value.quickIpInput) {
         val cleanIpOnly = RouterIpCacheVault.normalizeIpKey(targetIpOrUrl)
         if (cleanIpOnly.isEmpty()) {
@@ -772,10 +739,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (runningProfile != null && localRelay.isRelayActive()) {
                 localRelay.triggerPrewarmPoolReplenish(4)
-                WebViewProxyConfigurator.applyLocalRelayProxy(localRelay.boundPort)
+                WebViewProxyConfigurator.applyLocalRelayProxy(
+                    localPort = localRelay.boundPort,
+                    forceReapply = false,
+                    localHost = localRelay.activeLocalBindHost
+                )
                 VpnSocketProtector.log(
                     "QUICK-OPEN",
-                    "فتح $cleanRootUrl عبر البروكسي المشغّل (${runningProfile.proxyIp}:${runningProfile.proxyPort}) [${localRelay.currentSocketChannel().shortBadge}]",
+                    "فتح $cleanRootUrl عبر البروكسي المشغّل (${runningProfile.proxyIp}:${runningProfile.proxyPort}) [${localRelay.activeLocalBindHost}:${localRelay.boundPort}]",
                     LogLevel.SUCCESS
                 )
             } else {
@@ -790,10 +761,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Called when the WebView finishes loading or caches new images so the Saved IPs list
-     * immediately reflects the exact image count, file count, byte size, and page title.
-     */
     fun onBrowserPageAndCacheUpdated(url: String, title: String) {
         if (url.isBlank()) return
         val (updatedList, _) = upsertSavedRouterIp(
@@ -806,10 +773,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Closes the in-app WebView WITHOUT wiping the cache!
-     * Updates the saved IP's cache metrics so the user can reopen it with 0ms image loading anytime.
-     */
     fun closeQuickBrowser() {
         val currentUrl = _uiState.value.activeBrowserUrl.orEmpty()
         val refreshedList = _uiState.value.savedRouterIps.map { entry ->
@@ -838,9 +801,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Deletes a saved router IP and its associated cache from the Saved IPs tab.
-     */
     fun deleteSavedRouterIp(entry: SavedRouterIpEntry) {
         RouterIpCacheVault.clearCacheForIp(appCtx, entry.normalizedKey)
         val updatedList = _uiState.value.savedRouterIps.filterNot {
@@ -860,10 +820,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Clears ONLY the cached files/images for a specific IP while keeping the IP in the list
-     * (useful when the user wants to refresh the router's images from scratch).
-     */
     fun clearSingleIpCacheOnly(normalizedKey: String) {
         val cleanKey = RouterIpCacheVault.normalizeIpKey(normalizedKey)
         RouterIpCacheVault.clearCacheForIp(appCtx, cleanKey)
@@ -887,9 +843,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Clears all saved router IPs and their disk/RAM caches.
-     */
     fun clearAllSavedRouterIpsAndCache() {
         RouterIpCacheVault.clearAllIpsCache(appCtx)
         prefsRepo.saveRouterIpsList(emptyList())

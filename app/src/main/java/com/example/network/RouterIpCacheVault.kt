@@ -4,6 +4,7 @@ import android.content.Context
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -21,19 +22,7 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
-import org.json.JSONObject
 
-/**
- * RouterIpCacheVault
- *
- * Persistent Disk + RAM Cache Engine per Router IP:
- * - Automatically saves images (.png, .jpg, .jpeg, .gif, .webp, .svg, .ico, .bmp) and static
- *   router assets (.css, .js, .woff, .woff2, .ttf) for every IP opened in the WebView.
- * - When an already-saved IP is opened again, serves all cached images and assets in 0ms
- *   directly from RAM/Disk without re-downloading over Mobile Data + ZeroTier.
- * - Strictly deduplicates IPs using `normalizeIpKey(rawIpOrUrl)` so opening the same IP
- *   never creates duplicate entries in the Saved IPs list.
- */
 object RouterIpCacheVault : RouterIpCacheContract {
 
     data class CachedAsset(
@@ -46,9 +35,8 @@ object RouterIpCacheVault : RouterIpCacheContract {
     )
 
     private const val VAULT_ROOT_DIR = "router_ip_cache_v1"
-    private const val MAX_SINGLE_ASSET_BYTES = 8 * 1024 * 1024 // 8 MB max per single file
+    private const val MAX_SINGLE_ASSET_BYTES = 8 * 1024 * 1024
 
-    // Fast 0ms in-memory cache indexed by "$normalizedIpKey|$normalizedAssetKey"
     private val ramVault = ConcurrentHashMap<String, CachedAsset>()
 
     private val IMAGE_EXTENSIONS = listOf(
@@ -59,13 +47,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         ".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".otf"
     )
 
-    /**
-     * Normalizes any user-entered IP or URL into a canonical deduplication key (`host` or `host:port`).
-     * Examples:
-     * - "192.168.88.1" -> "192.168.88.1"
-     * - "http://192.168.88.1/webfig/#Wireless" -> "192.168.88.1"
-     * - "http://10.147.17.1:8080/login" -> "10.147.17.1:8080"
-     */
     override fun normalizeIpKey(rawIpOrUrl: String): String {
         var clean = rawIpOrUrl.trim()
         if (clean.isEmpty()) return ""
@@ -85,10 +66,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         }
     }
 
-    /**
-     * Normalizes user input into a clean root HTTP/HTTPS URL containing ONLY the IP/host
-     * without any sub-paths, query strings, or hash fragments (e.g. "http://192.168.88.1").
-     */
     override fun normalizeFullUrl(rawIpOrUrl: String): String {
         val trimmed = rawIpOrUrl.trim()
         if (trimmed.isEmpty()) return ""
@@ -98,10 +75,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         return if (isHttps) "https://$cleanIpKey" else "http://$cleanIpKey"
     }
 
-    /**
-     * Determines whether a request is for a router image or static asset that should be
-     * persistently cached in the IP Vault.
-     */
     override fun isCacheableRouterResource(requestUrl: String, acceptHeader: String): Boolean {
         val pathOnly = requestUrl
             .substringBefore("?")
@@ -118,7 +91,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
             lowerAccept.contains("text/css") ||
             lowerAccept.contains("application/javascript")
         ) {
-            // Avoid caching dynamic HTML documents as images just because Accept contains */*
             if (!lowerAccept.contains("text/html") && !lowerAccept.contains("application/xhtml+xml")) {
                 return true
             }
@@ -138,10 +110,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         return false
     }
 
-    /**
-     * Normalizes an asset URL so that transient query timestamps on static images/scripts
-     * still hit the cached asset for that IP.
-     */
     fun normalizeAssetCacheKey(requestUrl: String): String {
         val noFragment = requestUrl.substringBefore("#").trim()
         val pathOnly = noFragment.substringBefore("?")
@@ -175,9 +143,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         return sb.toString()
     }
 
-    /**
-     * Stores an image or static resource into both 0ms RAM cache and persistent disk vault for `normalizedIpKey`.
-     */
     fun putResource(
         context: Context,
         normalizedIpKey: String,
@@ -229,9 +194,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         return asset
     }
 
-    /**
-     * Retrieves a cached image or static asset in 0ms from RAM, or loads it from the disk vault into RAM.
-     */
     fun getResource(
         context: Context,
         normalizedIpKey: String,
@@ -275,10 +237,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         }
     }
 
-    /**
-     * Warms all disk-cached resources for `normalizedIpKey` into RAM so opening a saved IP
-     * serves every image in 0.0ms without even waiting for disk I/O.
-     */
     override fun warmIpCacheIntoRam(context: Context, normalizedIpKey: String): IpCacheStats {
         if (normalizedIpKey.isBlank()) return IpCacheStats()
         var imagesCount = 0
@@ -328,9 +286,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         )
     }
 
-    /**
-     * Returns current cache statistics (images count, static files count, total bytes) for `normalizedIpKey`.
-     */
     override fun getCacheStats(context: Context, normalizedIpKey: String): IpCacheStats {
         if (normalizedIpKey.isBlank()) return IpCacheStats()
         var imagesCount = 0
@@ -367,9 +322,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         )
     }
 
-    /**
-     * Deletes all cached images and files for a single IP key.
-     */
     override fun clearCacheForIp(context: Context, normalizedIpKey: String) {
         if (normalizedIpKey.isBlank()) return
         val prefix = "$normalizedIpKey|"
@@ -383,9 +335,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         }
     }
 
-    /**
-     * Deletes all cached router IP vaults on disk and RAM.
-     */
     override fun clearAllIpsCache(context: Context) {
         ramVault.clear()
         try {
@@ -397,12 +346,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
         }
     }
 
-    /**
-     * Intercepts WebView sub-resource requests for images and static assets:
-     * 1. If already cached in `RouterIpCacheVault` -> returns 0ms `WebResourceResponse` from RAM/Disk!
-     * 2. If not cached yet -> fetches through the active SOCKS5 local relay (or direct if proxy is off),
-     *    stores it in `RouterIpCacheVault` (RAM + Disk) so images never re-download again, and returns it.
-     */
     override fun interceptOrFetchAndCache(
         context: Context,
         normalizedIpKey: String,
@@ -422,13 +365,11 @@ object RouterIpCacheVault : RouterIpCacheContract {
             return null
         }
 
-        // 1. Check 0ms RAM / Disk Cache Hit first!
         val cached = getResource(context, normalizedIpKey, reqUrl)
         if (cached != null && cached.bytes.isNotEmpty()) {
             return buildImmutableWebResponse(cached)
         }
 
-        // 2. Cache Miss on first visit -> Fetch via active route (SOCKS5 relay or Direct) and persist to Vault
         return try {
             val downloaded = fetchResourceBytes(
                 requestUrl = reqUrl,
@@ -452,7 +393,6 @@ object RouterIpCacheVault : RouterIpCacheContract {
                 null
             }
         } catch (_: Exception) {
-            // Fall back to WebView's native loader if custom fetch fails
             null
         }
     }
@@ -500,7 +440,7 @@ object RouterIpCacheVault : RouterIpCacheContract {
             useCaches = true
 
             if (this is HttpsURLConnection) {
-                 configureTrustAllSsl(this)
+                configureTrustAllSsl(this)
             }
 
             setRequestProperty("Connection", "keep-alive")
@@ -559,10 +499,7 @@ object RouterIpCacheVault : RouterIpCacheContract {
                 encoding = charset
             )
         } finally {
-            try {
-                conn.disconnect()
-            } catch (_: Exception) {
-            }
+            try { conn.disconnect() } catch (_: Exception) {}
         }
     }
 

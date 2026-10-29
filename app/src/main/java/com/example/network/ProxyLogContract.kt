@@ -2,10 +2,6 @@ package com.example.network
 
 import kotlinx.coroutines.flow.StateFlow
 
-/**
- * واجهة مستقلة خاصة بنظام السجل الحي والإحصائيات (Logger & Telemetry Contract).
- * تفصل منطق تسجيل الأحداث وحركة البيانات عن بقية ملفات السوكيت والشبكة.
- */
 interface ProxyLogContract {
     val telemetry: StateFlow<TunnelTelemetry>
     val logs: StateFlow<List<PacketLogEntry>>

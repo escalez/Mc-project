@@ -1,11 +1,11 @@
 package com.example.network
 
-/**
- * واجهة مستقلة خاصة بمحرك الجسر المحلي للبروكسي (Proxy Relay Engine Contract).
- * تجمع وتنسق بين واجهة السوكيت، وواجهة قاطع الإغلاق، وواجهة مصافحة SOCKS5، وواجهة الـ DNS.
- */
 interface ProxyRelayEngineContract {
+    val activeLocalBindHost: String
     val boundPort: Int
+    val activeLocalSlotIndex: Int
+    val wifiLocalBindAddress: String
+    val cellularLocalBindAddress: String
 
     fun isRelayActive(): Boolean
     fun currentSessionId(): Long
@@ -13,20 +13,26 @@ interface ProxyRelayEngineContract {
     fun detectActiveSocketChannel(): ActiveSocketChannel
     fun setTurboPrewarmEnabled(enabled: Boolean)
     fun triggerPrewarmPoolReplenish(count: Int = 1)
+    fun rotateToNextAvailableLocalIp(reasonTag: String = "IP-POOL-ROTATE"): LocalIpLease?
 
     suspend fun startRelay(config: Socks5Config): Result<Int>
     suspend fun stopRelay()
     fun killAllSocketsNow(): Int
 
+    fun startBackgroundAutoReconnect(
+        config: Socks5Config = Socks5Config(),
+        reasonTag: String = "AUTO-RECONNECT"
+    )
+
     suspend fun verifyUpstreamConnectionWithRetry(
         config: Socks5Config = Socks5Config(),
         maxAttempts: Int = 2,
-        perAttemptTimeoutMs: Int = 7_500,
-        retryDelayMs: Long = 500L
+        perAttemptTimeoutMs: Int = 5_500,
+        retryDelayMs: Long = 450L
     ): Result<Long>
 
     suspend fun testUpstreamHandshake(
         config: Socks5Config = Socks5Config(),
-        timeoutMs: Int = 7_500
+        timeoutMs: Int = 5_500
     ): Result<Long>
 }

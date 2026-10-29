@@ -17,7 +17,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
@@ -25,21 +24,12 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * LocalSocksAuthRelay (Modular Interface-Driven Architecture)
- * -----------------------------------------------------------
- * منسق الجسر المحلي للبروكسي (`127.0.0.1:localPort`) المبني على واجهات مستقلة لكل ميزة:
- * - [SocketChannelContract] ([DedicatedSocketChannelEngine]): إدارة سوكيت الواي فاي وسوكيت بيانات الهاتف + ZeroTier.
- * - [ProxyKillSwitchContract] ([ProxySocketKillSwitch]): نظام قطع الاتصال وإغلاق جميع السوكيتات بضربة واحدة نظيفة.
- * - [Socks5HandshakeContract] ([Socks5ProtocolEngine]): بروتوكول ومصافحة SOCKS5 و RFC 1929 وفحص الاتصال الفعلي.
- * - [DnsResolverContract] ([InternalDnsResolver]): محرك الـ DNS الداخلي وفك عناوين IPv4 في 0ms.
- * - [ProxyLogContract] ([VpnSocketProtector]): نظام السجل والإحصائيات الحية.
- */
 class LocalSocksAuthRelay(
     context: Context,
     private val logger: ProxyLogContract = VpnSocketProtector,
     private val dnsResolver: DnsResolverContract = InternalDnsResolver,
     private val killSwitch: ProxyKillSwitchContract = ProxySocketKillSwitch(logger),
+    private val localIpPool: LocalIpPoolContract = DynamicLocalIpPoolManager(killSwitch, logger),
     private val socketChannel: SocketChannelContract = DedicatedSocketChannelEngine(
         context = context,
         killSwitch = killSwitch,
@@ -53,16 +43,25 @@ class LocalSocksAuthRelay(
     )
 ) : ProxyRelayEngineContract {
 
+    companion object {
+        const val WIFI_LOCAL_IP = "127.0.0.1"
+        const val CELLULAR_LOCAL_IP = "127.0.0.2"
+        const val DEFAULT_WIFI_PORT = 10808
+        const val DEFAULT_CELLULAR_PORT = 10809
+        const val MAX_POOL_USERS = LocalIpPoolContract.MAX_LOCAL_IP_SLOTS
+    }
+
     private val lifecycleMutex = Mutex()
+    private val leaseSwitchLock = Any()
     private val isRunning = AtomicBoolean(false)
     private val relaySessionId = AtomicLong(0L)
     private val turboModeEnabled = AtomicBoolean(true)
 
     @Volatile
-    private var serverSocket: ServerSocket? = null
+    private var activeLease: LocalIpLease? = null
 
     @Volatile
-    private var acceptJob: Job? = null
+    private var activeAcceptJob: Job? = null
 
     @Volatile
     private var watchdogJob: Job? = null
@@ -71,17 +70,31 @@ class LocalSocksAuthRelay(
     private var handoverJob: Job? = null
 
     @Volatile
+    private var autoReconnectJob: Job? = null
+
+    @Volatile
     private var relayScope: CoroutineScope? = null
 
     @Volatile
     private var currentConfig: Socks5Config = Socks5Config()
 
-    @Volatile
-    override var boundPort: Int = 10808
-        private set
+    override val activeLocalBindHost: String
+        get() = activeLease?.localIp ?: WIFI_LOCAL_IP
+
+    override val boundPort: Int
+        get() = activeLease?.localPort ?: DEFAULT_WIFI_PORT
+
+    override val activeLocalSlotIndex: Int
+        get() = activeLease?.slotIndex ?: 1
+
+    override val wifiLocalBindAddress: String
+        get() = activeLease?.bindAddress ?: "$WIFI_LOCAL_IP:$DEFAULT_WIFI_PORT"
+
+    override val cellularLocalBindAddress: String
+        get() = activeLease?.bindAddress ?: "$CELLULAR_LOCAL_IP:$DEFAULT_CELLULAR_PORT"
 
     override fun isRelayActive(): Boolean {
-        val srv = serverSocket
+        val srv = activeLease?.serverSocket
         return isRunning.get() && srv != null && !srv.isClosed
     }
 
@@ -95,21 +108,88 @@ class LocalSocksAuthRelay(
         turboModeEnabled.set(enabled)
     }
 
-    override fun triggerPrewarmPoolReplenish(count: Int) {
-        // Deliberately avoids opening multiple background sockets simultaneously on Mobile Data + ZeroTier
-        // so that ZeroTier's virtual interface is never flooded with parallel idle sockets.
-    }
+    override fun triggerPrewarmPoolReplenish(count: Int) = Unit
+
+    fun getLocalIpPoolManager(): LocalIpPoolContract = localIpPool
 
     override fun killAllSocketsNow(): Int {
         isRunning.set(false)
         relaySessionId.incrementAndGet()
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
         handoverJob?.cancel()
         handoverJob = null
         watchdogJob?.cancel()
         watchdogJob = null
-        acceptJob?.cancel()
-        acceptJob = null
+        activeAcceptJob?.cancel()
+        activeAcceptJob = null
+        activeLease = null
+        localIpPool.releaseAllSlots()
         return killSwitch.killAllSocketsNow(reasonTag = "KILL-SWITCH", logIfKilled = true)
+    }
+
+    override fun rotateToNextAvailableLocalIp(reasonTag: String): LocalIpLease? {
+        val scope = relayScope ?: return null
+        val sessionId = relaySessionId.get()
+        if (!isRunning.get()) return null
+
+        synchronized(leaseSwitchLock) {
+            if (!isRunning.get() || relaySessionId.get() != sessionId) return null
+
+            val previousLease = activeLease
+            val previousAcceptJob = activeAcceptJob
+            val basePort = currentConfig.localRelayPort.coerceIn(1025, 65000)
+
+            val newLease = localIpPool.acquireNextAvailableLocalIp(
+                basePort = basePort,
+                excludeSlotIndex = previousLease?.slotIndex ?: -1
+            )
+
+            activeLease = newLease
+            activeAcceptJob = launchServerAcceptLoop(
+                scope = scope,
+                lease = newLease,
+                sessionId = sessionId
+            )
+
+            scope.launch {
+                WebViewProxyConfigurator.applyLocalRelayProxy(
+                    localPort = newLease.localPort,
+                    forceReapply = true,
+                    localHost = newLease.localIp
+                )
+            }
+
+            previousAcceptJob?.cancel()
+            if (previousLease != null && previousLease.slotIndex != newLease.slotIndex) {
+                localIpPool.releaseAndDisconnectSlot(previousLease.slotIndex)
+            }
+
+            logger.updateTelemetry {
+                it.copy(
+                    localRelayRunning = true,
+                    localRelayBindAddress = newLease.bindAddress,
+                    wifiLocalRelayAddress = newLease.bindAddress,
+                    cellularLocalRelayAddress = newLease.bindAddress
+                )
+            }
+
+            return newLease
+        }
+    }
+
+    fun reclaimPrimaryLocalIpIfDisconnected(): Boolean {
+        val current = activeLease ?: return false
+        if (current.slotIndex == 1) return false
+        if (!isRunning.get()) return false
+
+        if (localIpPool.isSlotCompletelyFree(1) &&
+            localIpPool.getActiveSocketCountForSlot(current.slotIndex) == 0
+        ) {
+            val rotated = rotateToNextAvailableLocalIp(reasonTag = "RECLAIM-PRIMARY-IP")
+            return rotated?.slotIndex == 1
+        }
+        return false
     }
 
     override suspend fun startRelay(config: Socks5Config): Result<Int> =
@@ -132,61 +212,81 @@ class LocalSocksAuthRelay(
                     socketChannel.clearStaleProcessNetworkBinding()
                     dnsResolver.clearCache()
                     val activeChannel = socketChannel.detectActiveSocketChannel()
+                    val preferredBasePort = config.localRelayPort.coerceIn(1025, 65000)
 
-                    val preferredPort = config.localRelayPort.coerceIn(1025, 65534)
-                    val server = ServerSocket()
-                    server.reuseAddress = true
-                    try {
-                        server.bind(InetSocketAddress("127.0.0.1", preferredPort), 256)
-                    } catch (_: Exception) {
-                        server.bind(InetSocketAddress("127.0.0.1", 0), 256)
-                    }
+                    val initialLease = localIpPool.acquireNextAvailableLocalIp(
+                        basePort = preferredBasePort,
+                        excludeSlotIndex = -1
+                    )
+                    activeLease = initialLease
 
-                    boundPort = server.localPort
-                    serverSocket = server
-                    killSwitch.attachServerSocket(server)
                     isRunning.set(true)
+
+                    logger.updateTelemetry {
+                        it.copy(
+                            localRelayRunning = true,
+                            activeSocketChannel = activeChannel,
+                            localRelayBindAddress = initialLease.bindAddress,
+                            wifiLocalRelayAddress = initialLease.bindAddress,
+                            cellularLocalRelayAddress = initialLease.bindAddress
+                        )
+                    }
 
                     socketChannel.registerNetworkMonitor { _, newChannel ->
                         handleActualChannelSwitch(newChannel, sessionId)
                     }
 
                     logger.log(
-                        "SOCKET-ENGINE",
-                        "تم تفعيل [${activeChannel.labelAr}] على 127.0.0.1:$boundPort ➔ ${config.proxyIp}:${config.proxyPort}",
+                        "LOCAL-IP-POOL",
+                        "تم تفعيل مجمع الآيبيات المحلية الديناميكي (سعة $MAX_POOL_USERS مستخدم/آيبي) — القناة النشطة: [${activeChannel.shortBadge}]",
                         LogLevel.SUCCESS
                     )
 
-                    acceptJob = newScope.launch {
-                        while (isActive && isRunning.get() && relaySessionId.get() == sessionId) {
-                            val clientSocket = try {
-                                server.accept()
-                            } catch (_: Exception) {
-                                if (!isRunning.get() || relaySessionId.get() != sessionId) break
-                                continue
-                            }
-
-                            if (!isRunning.get() || relaySessionId.get() != sessionId) {
-                                killSwitch.untrackAndCloseSocket(clientSocket)
-                                break
-                            }
-
-                            killSwitch.trackSocket(clientSocket)
-                            launch {
-                                handleClientConnection(clientSocket, sessionId)
-                            }
-                        }
-                    }
+                    activeAcceptJob = launchServerAcceptLoop(
+                        scope = newScope,
+                        lease = initialLease,
+                        sessionId = sessionId
+                    )
 
                     startWatchdogMonitor(newScope, sessionId)
-                    Result.success(boundPort)
+                    Result.success(initialLease.localPort)
                 } catch (e: Exception) {
                     stopRelayInternalLocked(logKillSwitch = false)
-                    logger.log("RELAY-ERR", "فشل تشغيل الجسر المحلي: ${e.localizedMessage}", LogLevel.ERROR)
+                    logger.log("RELAY-ERR", "فشل تشغيل مجمع الجسر المحلي: ${e.localizedMessage}", LogLevel.ERROR)
                     Result.failure(e)
                 }
             }
         }
+
+    private fun launchServerAcceptLoop(
+        scope: CoroutineScope,
+        lease: LocalIpLease,
+        sessionId: Long
+    ): Job = scope.launch {
+        val server: ServerSocket = lease.serverSocket
+        while (isActive && isRunning.get() && relaySessionId.get() == sessionId && !server.isClosed) {
+            val clientSocket = try {
+                server.accept()
+            } catch (_: Exception) {
+                if (!isRunning.get() || relaySessionId.get() != sessionId || server.isClosed) break
+                continue
+            }
+
+            if (!isRunning.get() || relaySessionId.get() != sessionId) {
+                localIpPool.unregisterSocketOnSlot(lease.slotIndex, clientSocket)
+                break
+            }
+
+            localIpPool.registerSocketOnSlot(lease.slotIndex, clientSocket)
+            launch {
+                handleClientConnection(
+                    clientSocket = clientSocket,
+                    lease = lease,
+                    sessionId = sessionId
+                )
+            }
+        }
+    }
 
     override suspend fun stopRelay() {
         lifecycleMutex.withLock {
@@ -202,24 +302,25 @@ class LocalSocksAuthRelay(
 
         socketChannel.unregisterNetworkMonitor()
 
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+
         handoverJob?.cancel()
         handoverJob = null
 
         watchdogJob?.cancel()
         watchdogJob = null
 
-        acceptJob?.cancel()
-        acceptJob = null
+        activeAcceptJob?.cancel()
+        activeAcceptJob = null
 
         relayScope?.let { scope ->
-            try {
-                scope.coroutineContext[Job]?.cancel()
-            } catch (_: Exception) {
-            }
+            try { scope.coroutineContext[Job]?.cancel() } catch (_: Exception) {}
         }
         relayScope = null
 
-        serverSocket = null
+        activeLease = null
+        localIpPool.releaseAllSlots()
         killSwitch.killAllSocketsNow(
             reasonTag = "KILL-SWITCH",
             logIfKilled = logKillSwitch && wasActive
@@ -235,6 +336,104 @@ class LocalSocksAuthRelay(
         }
     }
 
+    override fun startBackgroundAutoReconnect(
+        config: Socks5Config,
+        reasonTag: String
+    ) {
+        val scope = relayScope ?: return
+        val sessionId = relaySessionId.get()
+        if (!isRunning.get()) return
+
+        val cfg = if (config.isValid) config else currentConfig
+        if (!cfg.isValid) return
+
+        autoReconnectJob?.cancel()
+        autoReconnectJob = scope.launch {
+            var attempt = 1
+            while (isActive && isRunning.get() && relaySessionId.get() == sessionId) {
+                if (attempt > 1 && (attempt % 2 == 0 || (activeLocalSlotIndex > 1 && localIpPool.isSlotCompletelyFree(1)))) {
+                    rotateToNextAvailableLocalIp(reasonTag = "AUTO-IP-POOL")
+                }
+
+                val activeChan = socketChannel.detectActiveSocketChannel()
+                val activeBindAddr = "$activeLocalBindHost:$boundPort"
+
+                WebViewProxyConfigurator.applyLocalRelayProxy(
+                    localPort = boundPort,
+                    forceReapply = (attempt == 1),
+                    localHost = activeLocalBindHost
+                )
+
+                logger.updateTelemetry {
+                    it.copy(
+                        status = ConnectionStatus.RECONNECTING,
+                        localRelayRunning = true,
+                        activeSocketChannel = activeChan,
+                        localRelayBindAddress = activeBindAddr,
+                        wifiLocalRelayAddress = activeBindAddr,
+                        cellularLocalRelayAddress = activeBindAddr,
+                        watchdogHealthy = false,
+                        statusDetail = "إعادة ربط تلقائية ذكية (#$attempt) عبر [${activeChan.shortBadge}] — بانتظار استجابة مسار ZeroTier..."
+                    )
+                }
+
+                val res = testUpstreamHandshake(
+                    config = cfg,
+                    timeoutMs = 4_200
+                )
+
+                if (!isRunning.get() || relaySessionId.get() != sessionId) break
+
+                if (res.isSuccess) {
+                    val rtt = res.getOrDefault(1L)
+                    markRelayConnectedNow(rtt = rtt, channel = activeChan, sourceTag = reasonTag)
+                    break
+                }
+
+                attempt++
+                delay(2_000L)
+            }
+        }
+    }
+
+    private suspend fun markRelayConnectedNow(
+        rtt: Long,
+        channel: ActiveSocketChannel,
+        sourceTag: String
+    ) {
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+
+        reclaimPrimaryLocalIpIfDisconnected()
+
+        val activeBindAddr = "$activeLocalBindHost:$boundPort"
+        WebViewProxyConfigurator.applyLocalRelayProxy(
+            localPort = boundPort,
+            forceReapply = true,
+            localHost = activeLocalBindHost
+        )
+
+        logger.updateTelemetry {
+            it.copy(
+                status = ConnectionStatus.CONNECTED,
+                localRelayRunning = true,
+                activeSocketChannel = channel,
+                localRelayBindAddress = activeBindAddr,
+                wifiLocalRelayAddress = activeBindAddr,
+                cellularLocalRelayAddress = activeBindAddr,
+                lastWatchdogPingMs = rtt,
+                watchdogHealthy = true,
+                statusDetail = "متصل فعلياً: ${currentConfig.proxyIp}:${currentConfig.proxyPort} (${rtt}ms) عبر [${channel.shortBadge}]"
+            )
+        }
+
+        logger.log(
+            sourceTag,
+            "تم الاتصال الفعلي بالبروكسي ${currentConfig.proxyIp}:${currentConfig.proxyPort} (${rtt}ms) عبر [${channel.shortBadge}]",
+            LogLevel.SUCCESS
+        )
+    }
+
     private fun handleActualChannelSwitch(newChannel: ActiveSocketChannel, sessionId: Long) {
         val scope = relayScope ?: return
         if (!isRunning.get() || relaySessionId.get() != sessionId) return
@@ -245,55 +444,45 @@ class LocalSocksAuthRelay(
 
             socketChannel.clearStaleProcessNetworkBinding()
             dnsResolver.clearCache()
-            killSwitch.flushActiveSocketsPreserveServer("NET-HANDOVER")
+
+            val newLease = rotateToNextAvailableLocalIp(reasonTag = "NET-HANDOVER")
+            val newBindAddr = newLease?.bindAddress ?: "$activeLocalBindHost:$boundPort"
 
             logger.updateTelemetry {
                 it.copy(
                     activeSocketChannel = newChannel,
+                    localRelayRunning = true,
+                    localRelayBindAddress = newBindAddr,
+                    wifiLocalRelayAddress = newBindAddr,
+                    cellularLocalRelayAddress = newBindAddr,
                     status = ConnectionStatus.RECONNECTING,
-                    statusDetail = "تم التحويل إلى [${newChannel.labelAr}] — جاري تحديث مسار البروكسي..."
+                    statusDetail = "تم التحول الفوري إلى قناة [${newChannel.shortBadge}] — جاري ربط مسار ZeroTier..."
                 )
             }
 
-            delay(750L)
+            delay(350L)
             if (!isRunning.get() || relaySessionId.get() != sessionId) return@launch
 
             val verifyResult = verifyUpstreamConnectionWithRetry(
                 config = currentConfig,
-                maxAttempts = 3,
-                perAttemptTimeoutMs = socketChannel.recommendedConnectTimeoutMs(7_500),
-                retryDelayMs = 600L
+                maxAttempts = 2,
+                perAttemptTimeoutMs = 4_500,
+                retryDelayMs = 400L
             )
 
             if (!isRunning.get() || relaySessionId.get() != sessionId) return@launch
 
             verifyResult.fold(
                 onSuccess = { rtt ->
-                    WebViewProxyConfigurator.applyLocalRelayProxy(boundPort, forceReapply = true)
-                    logger.updateTelemetry {
-                        it.copy(
-                            status = ConnectionStatus.CONNECTED,
-                            localRelayRunning = true,
-                            activeSocketChannel = newChannel,
-                            lastWatchdogPingMs = rtt,
-                            watchdogHealthy = true,
-                            statusDetail = "متصل فعلياً: ${currentConfig.proxyIp}:${currentConfig.proxyPort} (${rtt}ms) عبر [${newChannel.labelAr}]"
-                        )
-                    }
-                    logger.log(
-                        "NET-HANDOVER",
-                        "نجح تحويل مسار البروكسي إلى [${newChannel.labelAr}] (${rtt}ms)",
-                        LogLevel.SUCCESS
-                    )
+                    markRelayConnectedNow(rtt = rtt, channel = newChannel, sourceTag = "NET-HANDOVER")
                 },
-                onFailure = { err ->
-                    logger.updateTelemetry {
-                        it.copy(
-                            watchdogHealthy = false,
-                            activeSocketChannel = newChannel,
-                            statusDetail = "انتظار استقرار مسار ZeroTier عبر [${newChannel.shortBadge}]: ${err.localizedMessage ?: ""}"
-                        )
-                    }
+                onFailure = {
+                    logger.log(
+                        "AUTO-RECONNECT",
+                        "مسار ZeroTier يعيد التموضع على 4G — تفعيل حلقة الربط التلقائي الذكي كل ثانيتين",
+                        LogLevel.INFO
+                    )
+                    startBackgroundAutoReconnect(config = currentConfig, reasonTag = "AUTO-RECOVER")
                 }
             )
         }
@@ -305,18 +494,18 @@ class LocalSocksAuthRelay(
             delay(15_000L)
             var consecutiveFailures = 0
             while (isActive && isRunning.get() && relaySessionId.get() == sessionId) {
-                // Do not open watchdog sockets while active transfers are running
-                val activeConns = logger.telemetry.value.activeConnections
-                if (activeConns > 0) {
+                if (autoReconnectJob?.isActive == true || logger.telemetry.value.activeConnections > 0) {
                     consecutiveFailures = 0
-                    delay(20_000L)
+                    delay(18_000L)
                     continue
                 }
+
+                reclaimPrimaryLocalIpIfDisconnected()
 
                 val activeChan = socketChannel.detectActiveSocketChannel()
                 val pingRes = testUpstreamHandshake(
                     config = currentConfig,
-                    timeoutMs = socketChannel.recommendedConnectTimeoutMs(6_000)
+                    timeoutMs = socketChannel.recommendedConnectTimeoutMs(5_000)
                 )
 
                 if (!isRunning.get() || relaySessionId.get() != sessionId) break
@@ -324,11 +513,15 @@ class LocalSocksAuthRelay(
                 pingRes.fold(
                     onSuccess = { rtt ->
                         consecutiveFailures = 0
+                        val activeBindAddr = "$activeLocalBindHost:$boundPort"
                         logger.updateTelemetry {
                             it.copy(
                                 status = ConnectionStatus.CONNECTED,
                                 localRelayRunning = true,
                                 activeSocketChannel = activeChan,
+                                localRelayBindAddress = activeBindAddr,
+                                wifiLocalRelayAddress = activeBindAddr,
+                                cellularLocalRelayAddress = activeBindAddr,
                                 lastWatchdogPingMs = rtt,
                                 watchdogHealthy = true,
                                 statusDetail = "متصل فعلياً: ${currentConfig.proxyIp}:${currentConfig.proxyPort} (${rtt}ms) عبر [${activeChan.shortBadge}]"
@@ -337,19 +530,13 @@ class LocalSocksAuthRelay(
                     },
                     onFailure = {
                         consecutiveFailures++
-                        if (consecutiveFailures >= 3 && isRunning.get() && relaySessionId.get() == sessionId) {
+                        if (consecutiveFailures >= 2 && isRunning.get() && relaySessionId.get() == sessionId) {
                             socketChannel.clearStaleProcessNetworkBinding()
-                            logger.updateTelemetry {
-                                it.copy(
-                                    watchdogHealthy = false,
-                                    activeSocketChannel = activeChan,
-                                    statusDetail = "تنبيه: استجابة البروكسي بطيئة عبر [${activeChan.shortBadge}]"
-                                )
-                            }
+                            startBackgroundAutoReconnect(config = currentConfig, reasonTag = "WATCHDOG-RECOVER")
                         }
                     }
                 )
-                delay(22_000L)
+                delay(20_000L)
             }
         }
     }
@@ -390,7 +577,11 @@ class LocalSocksAuthRelay(
         )
     }
 
-    private suspend fun handleClientConnection(clientSocket: Socket, sessionId: Long) = withContext(Dispatchers.IO) {
+    private suspend fun handleClientConnection(
+        clientSocket: Socket,
+        lease: LocalIpLease,
+        sessionId: Long
+    ) = withContext(Dispatchers.IO) {
         var upstreamSocket: Socket? = null
         logger.adjustActiveConnections(1)
         try {
@@ -408,15 +599,45 @@ class LocalSocksAuthRelay(
             if (firstByte == -1) return@withContext
             bufferedClientIn.reset()
 
+            val connectStartNs = System.nanoTime()
             upstreamSocket = when (firstByte) {
-                0x05 -> handleLocalSocks5Client(DataInputStream(bufferedClientIn), clientOut, sessionId)
-                0x04 -> handleLocalSocks4Client(DataInputStream(bufferedClientIn), clientOut, sessionId)
-                else -> handleLocalHttpClient(bufferedClientIn, clientOut, sessionId)
+                0x05 -> handleLocalSocks5Client(
+                    clientIn = DataInputStream(bufferedClientIn),
+                    clientOut = clientOut,
+                    localBindIpBytes = lease.localIpBytes,
+                    localPort = lease.localPort,
+                    sessionId = sessionId
+                )
+                0x04 -> handleLocalSocks4Client(
+                    clientIn = DataInputStream(bufferedClientIn),
+                    clientOut = clientOut,
+                    sessionId = sessionId
+                )
+                else -> handleLocalHttpClient(
+                    clientIn = bufferedClientIn,
+                    clientOut = clientOut,
+                    sessionId = sessionId
+                )
+            }
+
+            if (upstreamSocket != null) {
+                localIpPool.registerSocketOnSlot(lease.slotIndex, upstreamSocket)
             }
 
             if (!isRunning.get() || relaySessionId.get() != sessionId) {
-                killSwitch.untrackAndCloseSocket(upstreamSocket)
+                if (upstreamSocket != null) {
+                    localIpPool.unregisterSocketOnSlot(lease.slotIndex, upstreamSocket)
+                }
                 return@withContext
+            }
+
+            if (logger.telemetry.value.status != ConnectionStatus.CONNECTED) {
+                val rtt = ((System.nanoTime() - connectStartNs) / 1_000_000L).coerceAtLeast(1L)
+                markRelayConnectedNow(
+                    rtt = rtt,
+                    channel = socketChannel.currentSocketChannel(),
+                    sourceTag = "LIVE-TRAFFIC-CONNECTED"
+                )
             }
 
             logger.incrementHandshakes()
@@ -439,14 +660,22 @@ class LocalSocksAuthRelay(
             }
         } finally {
             logger.adjustActiveConnections(-1)
-            killSwitch.untrackAndCloseSocket(upstreamSocket)
-            killSwitch.untrackAndCloseSocket(clientSocket)
+            if (upstreamSocket != null) {
+                localIpPool.unregisterSocketOnSlot(lease.slotIndex, upstreamSocket)
+            }
+            localIpPool.unregisterSocketOnSlot(lease.slotIndex, clientSocket)
+
+            if (lease.slotIndex > 1 && localIpPool.getActiveSocketCountForSlot(lease.slotIndex) == 0) {
+                reclaimPrimaryLocalIpIfDisconnected()
+            }
         }
     }
 
     private fun handleLocalSocks5Client(
         clientIn: DataInputStream,
         clientOut: OutputStream,
+        localBindIpBytes: ByteArray,
+        localPort: Int,
         sessionId: Long
     ): Socket {
         val ver = clientIn.readUnsignedByte()
@@ -462,7 +691,7 @@ class LocalSocksAuthRelay(
         val cmdVer = clientIn.readUnsignedByte()
         if (cmdVer != 0x05) throw IOException("إصدار طلب SOCKS5 غير صالح: $cmdVer")
         val cmd = clientIn.readUnsignedByte()
-        clientIn.readUnsignedByte() // RSV
+        clientIn.readUnsignedByte()
         val atyp = clientIn.readUnsignedByte()
 
         val targetHost: String
@@ -523,9 +752,9 @@ class LocalSocksAuthRelay(
         clientOut.write(
             byteArrayOf(
                 0x05, 0x00, 0x00, 0x01,
-                127, 0, 0, 1,
-                ((boundPort shr 8) and 0xFF).toByte(),
-                (boundPort and 0xFF).toByte()
+                localBindIpBytes[0], localBindIpBytes[1], localBindIpBytes[2], localBindIpBytes[3],
+                ((localPort shr 8) and 0xFF).toByte(),
+                (localPort and 0xFF).toByte()
             )
         )
         clientOut.flush()
@@ -543,9 +772,7 @@ class LocalSocksAuthRelay(
         val dstPort = clientIn.readUnsignedShort()
         val ipBytes = ByteArray(4)
         clientIn.readFully(ipBytes)
-        while (clientIn.read() > 0) {
-            // Drain user ID
-        }
+        while (clientIn.read() > 0) {}
 
         val targetHost = if (ipBytes[0].toInt() == 0 && ipBytes[1].toInt() == 0 &&
             ipBytes[2].toInt() == 0 && ipBytes[3].toInt() != 0
@@ -714,7 +941,7 @@ class LocalSocksAuthRelay(
         val cfg = currentConfig
         val proxyIp = cfg.proxyIp.trim()
         val proxyPort = cfg.proxyPort
-        val connectTimeout = socketChannel.recommendedConnectTimeoutMs(6_000)
+        val connectTimeout = socketChannel.recommendedConnectTimeoutMs(5_500)
 
         var effectiveAtyp = atyp
         var effectiveRawBytes = rawAddressBytes
@@ -759,7 +986,6 @@ class LocalSocksAuthRelay(
         } catch (socksErr: Exception) {
             killSwitch.untrackAndCloseSocket(sock)
 
-            // Fallback: HTTP CONNECT proxy if the user entered an HTTP proxy port
             var httpSock: Socket? = null
             try {
                 httpSock = socketChannel.openDedicatedChannelSocket(
@@ -788,9 +1014,7 @@ class LocalSocksAuthRelay(
                 if (!statusLine.contains(" 200 ")) {
                     throw IOException("رد البروكسي: $statusLine")
                 }
-                while (readAsciiLine(upIn).isNotEmpty()) {
-                    // Drain headers
-                }
+                while (readAsciiLine(upIn).isNotEmpty()) {}
                 return httpSock
             } catch (_: Exception) {
                 killSwitch.untrackAndCloseSocket(httpSock)
@@ -821,10 +1045,7 @@ class LocalSocksAuthRelay(
                 }
             } catch (_: Exception) {
             } finally {
-                try {
-                    upstreamSocket.shutdownOutput()
-                } catch (_: Exception) {
-                }
+                try { upstreamSocket.shutdownOutput() } catch (_: Exception) {}
             }
         }
 
@@ -840,18 +1061,12 @@ class LocalSocksAuthRelay(
                 }
             } catch (_: Exception) {
             } finally {
-                try {
-                    clientSocket.shutdownOutput()
-                } catch (_: Exception) {
-                }
+                try { clientSocket.shutdownOutput() } catch (_: Exception) {}
             }
         }
 
         upstreamToClient.join()
-        try {
-            clientSocket.close()
-        } catch (_: Exception) {
-        }
+        try { clientSocket.close() } catch (_: Exception) {}
         clientToUpstream.cancel()
     }
 
@@ -859,8 +1074,7 @@ class LocalSocksAuthRelay(
         val sb = StringBuilder()
         while (true) {
             val b = input.read()
-            if (b == -1) break
-            if (b == '\n'.code) break
+            if (b == -1 || b == '\n'.code) break
             if (b != '\r'.code) {
                 sb.append(b.toChar())
             }

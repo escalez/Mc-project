@@ -57,18 +57,20 @@ enum class RoutingMode(
 
 enum class ActiveSocketChannel(
     val labelAr: String,
-    val shortBadge: String
+    val shortBadge: String,
+    val dedicatedLocalIp: String,
+    val defaultLocalPort: Int
 ) {
-    STANDBY("مغلق تماماً (وضع الاستعداد)", "STANDBY"),
-    WIFI_DEDICATED("سوكيت الوايفاي المستقل (Wi-Fi Socket)", "WIFI-SOCK"),
-    CELLULAR_ZEROTIER("سوكيت بيانات الهاتف + ZeroTier المستقل", "DATA+ZT-SOCK")
+    STANDBY("مغلق تماماً (وضع الاستعداد)", "STANDBY", "127.0.0.1", 10808),
+    WIFI_DEDICATED("سوكيت الوايفاي المستقل (Wi-Fi Socket)", "WIFI-SOCK", "127.0.0.1", 10808),
+    CELLULAR_ZEROTIER("سوكيت بيانات الهاتف + ZeroTier المستقل", "DATA+ZT-SOCK", "127.0.0.2", 10809)
 }
 
 enum class ConnectionStatus(val labelAr: String) {
     DISCONNECTED("غير متصل"),
     CONNECTING("جاري فحص والاتصال بالبروكسي..."),
     CONNECTED("متصل (وضع البروكسي المستقل)"),
-    RECONNECTING("إعادة ربط تلقائية (Watchdog)..."),
+    RECONNECTING("إعادة ربط تلقائية ذكية (Auto-Reconnect)..."),
     ERROR("فشل الاتصال بالبروكسي")
 }
 
@@ -80,6 +82,8 @@ data class TunnelTelemetry(
     val killedSocketsCount: Int = 0,
     val localRelayRunning: Boolean = false,
     val localRelayBindAddress: String = "127.0.0.1:10808",
+    val wifiLocalRelayAddress: String = "127.0.0.1:10808",
+    val cellularLocalRelayAddress: String = "127.0.0.2:10809",
     val activeConnections: Int = 0,
     val totalHandshakes: Int = 0,
     val bytesSent: Long = 0L,

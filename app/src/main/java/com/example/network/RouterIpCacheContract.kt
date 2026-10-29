@@ -4,9 +4,6 @@ import android.content.Context
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 
-/**
- * واجهة مستقلة خاصة بخزنة حفظ الايبيات وكاش الصور والملفات (Router IP Cache Contract).
- */
 interface RouterIpCacheContract {
     fun normalizeIpKey(rawIpOrUrl: String): String
     fun normalizeFullUrl(rawIpOrUrl: String): String

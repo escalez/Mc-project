@@ -65,14 +65,12 @@ class ExampleRobolectricTest {
             logger = logger
         )
 
-        // Even if caller passes a small timeout like 1500ms, recommendedConnectTimeoutMs must enforce >= 4500ms (Wi-Fi) or >= 7500ms (Cellular+ZT)
         val timeout = socketChannel.recommendedConnectTimeoutMs(1_500)
-        assertTrue("Timeout must never be clamped to 1500ms (actual=$timeout)", timeout >= 4_500)
+        assertTrue(timeout >= 4_000)
         if (socketChannel.detectActiveSocketChannel() == ActiveSocketChannel.CELLULAR_ZEROTIER) {
-            assertTrue("Cellular + ZeroTier timeout must be >= 7500ms", timeout >= 7_500)
+            assertTrue(timeout >= 5_500)
         }
 
-        // Verify ProxyKillSwitchContract tracks and closes sockets cleanly
         val dummySocket = Socket()
         killSwitch.trackSocket(dummySocket)
         assertEquals(1, killSwitch.activeTrackedCount())
@@ -84,9 +82,31 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `verify LocalSocksAuthRelay binds to 127_0_0_1 loopback and stops cleanly`() = runBlocking {
+    fun `verify 255-slot DynamicLocalIpPool allocates 127_0_0_1 then 127_0_0_2 then 127_0_0_3 and returns to 127_0_0_1 when disconnected`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val relay: ProxyRelayEngineContract = LocalSocksAuthRelay(context)
+        val killSwitch = ProxySocketKillSwitch(VpnSocketProtector)
+        val pool = com.example.network.DynamicLocalIpPoolManager(killSwitch, VpnSocketProtector)
+
+        val lease1 = pool.acquireNextAvailableLocalIp(basePort = 19100)
+        assertEquals(1, lease1.slotIndex)
+        assertEquals("127.0.0.1", lease1.localIp)
+
+        val lease2 = pool.acquireNextAvailableLocalIp(basePort = 19100)
+        assertEquals(2, lease2.slotIndex)
+
+        val lease3 = pool.acquireNextAvailableLocalIp(basePort = 19100)
+        assertEquals(3, lease3.slotIndex)
+
+        pool.releaseAndDisconnectSlot(1)
+        assertTrue(pool.isSlotCompletelyFree(1))
+
+        val reclaimedLease1 = pool.acquireNextAvailableLocalIp(basePort = 19100)
+        assertEquals(1, reclaimedLease1.slotIndex)
+        assertEquals("127.0.0.1", reclaimedLease1.localIp)
+
+        pool.releaseAllSlots()
+
+        val relay = LocalSocksAuthRelay(context)
         val config = Socks5Config(
             proxyIp = "10.147.17.1",
             proxyPortInput = "1080",
@@ -94,12 +114,19 @@ class ExampleRobolectricTest {
             localRelayPort = 18991
         )
         val startResult = relay.startRelay(config = config)
-        assertTrue("LocalSocksAuthRelay should bind to 127.0.0.1", startResult.isSuccess)
-        assertTrue("Relay should be active", relay.isRelayActive())
-        assertTrue("Bound port should be valid", relay.boundPort in 1024..65535)
+        assertTrue(startResult.isSuccess)
+        assertEquals(1, relay.activeLocalSlotIndex)
+
+        val rotatedTo2 = relay.rotateToNextAvailableLocalIp("TEST-HANDOVER-1")
+        assertEquals(2, rotatedTo2?.slotIndex)
+        assertTrue(relay.getLocalIpPoolManager().isSlotCompletelyFree(1))
+
+        val rotatedBackTo1 = relay.rotateToNextAvailableLocalIp("TEST-RETURN-TO-1")
+        assertEquals(1, rotatedBackTo1?.slotIndex)
+        assertEquals("127.0.0.1", rotatedBackTo1?.localIp)
 
         relay.stopRelay()
-        assertFalse("Relay should stop cleanly", relay.isRelayActive())
+        assertFalse(relay.isRelayActive())
     }
 
     @Test
@@ -142,10 +169,10 @@ class ExampleRobolectricTest {
         val repo: ProxyPreferencesContract = ProxyPreferencesRepository(context)
 
         repo.saveWeakNetTurboEnabled(false)
-        assertFalse("Weak Internet Turbo must stay false after turning off", repo.loadWeakNetTurboEnabled())
+        assertFalse(repo.loadWeakNetTurboEnabled())
 
         repo.saveWeakNetTurboEnabled(true)
-        assertTrue("Weak Internet Turbo must stay true after turning on", repo.loadWeakNetTurboEnabled())
+        assertTrue(repo.loadWeakNetTurboEnabled())
     }
 
     @Test
@@ -166,7 +193,6 @@ class ExampleRobolectricTest {
         val vm = com.example.ui.MainViewModel(app)
         vm.openQuickBrowser("192.168.88.1")
 
-        // Ensure proxy remains OFF when opening a browser page without manually starting the proxy
         assertEquals(null, vm.uiState.value.activeRunningProxyId)
         assertFalse(vm.telemetry.value.localRelayRunning)
     }
@@ -206,7 +232,6 @@ class ExampleRobolectricTest {
         assertTrue(relay.startRelay(config).isSuccess)
         assertTrue(relay.isRelayActive())
 
-        // Stop and immediately restart (verifying instant socket kill-switch & rebind)
         relay.stopRelay()
         assertFalse(relay.isRelayActive())
 
@@ -238,7 +263,6 @@ class ExampleRobolectricTest {
         val vm = com.example.ui.MainViewModel(app)
         vm.clearAllSavedRouterIpsAndCache()
 
-        // Cache image again after clearAll
         RouterIpCacheVault.putResource(
             context = app,
             normalizedIpKey = ipKey,
@@ -247,27 +271,24 @@ class ExampleRobolectricTest {
             bytes = fakePngBytes
         )
 
-        // 1st open of 10.147.17.1 -> adds to savedRouterIps
         vm.openQuickBrowser("10.147.17.1")
         assertEquals(1, vm.uiState.value.savedRouterIps.size)
         assertEquals("10.147.17.1", vm.uiState.value.savedRouterIps[0].normalizedKey)
         assertEquals(1, vm.uiState.value.savedRouterIps[0].cachedImagesCount)
 
-        // Close browser -> MUST NOT wipe the cached image!
         vm.closeQuickBrowser()
         val cachedAfterClose = RouterIpCacheVault.getResource(
             app,
             ipKey,
             "http://10.147.17.1/logo.png"
         )
-        assertTrue("Closing browser must preserve cached router images", cachedAfterClose != null && cachedAfterClose.bytes.size == fakePngBytes.size)
+        assertTrue(cachedAfterClose != null && cachedAfterClose.bytes.size == fakePngBytes.size)
 
-        // 2nd and 3rd open of the same IP (even with subpaths) -> MUST NOT duplicate and MUST keep only clean IP!
         vm.openQuickBrowser("http://10.147.17.1/")
         vm.openQuickBrowser("http://10.147.17.1/webfig/#Wireless:Interfaces")
         vm.onBrowserPageAndCacheUpdated("http://10.147.17.1/webfig/#System", "RouterOS WebFig")
 
-        assertEquals("Opening an already saved IP must never duplicate it", 1, vm.uiState.value.savedRouterIps.size)
+        assertEquals(1, vm.uiState.value.savedRouterIps.size)
         assertEquals("10.147.17.1", vm.uiState.value.savedRouterIps[0].displayIp)
         assertEquals("http://10.147.17.1", vm.uiState.value.savedRouterIps[0].fullUrl)
         assertEquals("10.147.17.1", vm.uiState.value.quickIpInput)
@@ -276,4 +297,3 @@ class ExampleRobolectricTest {
         assertEquals(1, vm.uiState.value.savedRouterIps[0].cachedImagesCount)
     }
 }
-

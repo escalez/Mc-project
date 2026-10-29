@@ -23,7 +23,6 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Save
@@ -61,12 +60,6 @@ import com.example.ui.theme.RobotoMonoFontFamily
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextSecondary
 
-/**
- * Middle Tab (Index 1): "الايبيات المحفوظة مع الكاش الخاص بها"
- * - Automatically lists every IP opened in the WebView along with its cached images & files.
- * - Strictly deduplicated by IP/Host: opening an already-saved IP never duplicates it here;
- *   instead it pulls its saved cache immediately so images load in 0ms over Mobile Data.
- */
 @Composable
 fun SavedIpsWithCacheTab(
     savedRouterIps: List<SavedRouterIpEntry>,
@@ -87,7 +80,6 @@ fun SavedIpsWithCacheTab(
             .testTag("saved_ips_cache_tab_container"),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Header Summary Card
         Surface(
             color = CyberCard,
             shape = RoundedCornerShape(16.dp),
@@ -167,7 +159,6 @@ fun SavedIpsWithCacheTab(
                     }
                 }
 
-                // Cache Vault Telemetry Strip
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -384,7 +375,6 @@ private fun SavedRouterIpCard(
                 }
             }
 
-            // Detailed Image & Asset Cache Pills
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -418,7 +408,6 @@ private fun SavedRouterIpCard(
                 )
             }
 
-            // Action Buttons: Instant Open from Cache + Refresh Cache
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),

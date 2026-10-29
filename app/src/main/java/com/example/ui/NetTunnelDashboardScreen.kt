@@ -251,7 +251,7 @@ fun NetTunnelDashboardScreen(
                         1 -> SavedIpsWithCacheTab(
                             savedRouterIps = uiState.savedRouterIps,
                             isProxyActive = uiState.activeRunningProxyId != null &&
-                                telemetry.status == ConnectionStatus.CONNECTED,
+                                (telemetry.status == ConnectionStatus.CONNECTED || telemetry.localRelayRunning),
                             onOpenSavedIpWithCache = onOpenQuickBrowser,
                             onClearSingleIpCache = onClearSingleIpCache,
                             onDeleteSavedIp = onDeleteSavedRouterIp,
@@ -269,7 +269,8 @@ fun NetTunnelDashboardScreen(
             uiState.activeBrowserUrl?.let { targetUrl ->
                 val runningProfile = uiState.activeProxyProfile
                 val activeCfg = runningProfile?.toSocks5Config() ?: Socks5Config()
-                val isProxyRunning = runningProfile != null && telemetry.status == ConnectionStatus.CONNECTED
+                val isProxyRunning = runningProfile != null &&
+                    (telemetry.status == ConnectionStatus.CONNECTED || telemetry.localRelayRunning)
                 QuickRouterBrowserDialog(
                     initialUrl = targetUrl,
                     socksConfig = activeCfg,
@@ -365,7 +366,8 @@ private fun TopCommandHeader(
                             ) {
                                 Text(
                                     text = when {
-                                        isStrictlyConnected -> "متصل فعلياً (${telemetry.activeSocketChannel.shortBadge})"
+                                        isStrictlyConnected -> "متصل (${telemetry.activeSocketChannel.shortBadge})"
+                                        telemetry.status == ConnectionStatus.RECONNECTING -> "ربط تلقائي ذكي (${telemetry.activeSocketChannel.shortBadge})"
                                         isConnectingOrReconnecting -> "جاري الفحص والربط..."
                                         else -> telemetry.status.labelAr
                                     },
@@ -381,8 +383,8 @@ private fun TopCommandHeader(
                             text = when {
                                 isStrictlyConnected && activeProfile != null ->
                                     "نشط: ${activeProfile.displayTitle} (${activeProfile.proxyIp}:${activeProfile.proxyPort})"
-                                isConnectingOrReconnecting && activeProfile != null ->
-                                    "جاري فحص استجابة البروكسي (${activeProfile.displayTitle}) لمنع الاتصال الوهمي..."
+                                isConnectingOrReconnecting ->
+                                    telemetry.statusDetail
                                 else ->
                                     telemetry.statusDetail
                             },
@@ -563,7 +565,6 @@ private fun StandaloneProxyAndPageTab(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Card 1: Dedicated Dual-Socket Architecture (Wi-Fi Socket vs Mobile Data Socket) + Internal Anti-Block DNS
         Surface(
             color = CyberCard,
             shape = RoundedCornerShape(16.dp),
@@ -603,13 +604,13 @@ private fun StandaloneProxyAndPageTab(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "نظام السوكيت المزدوج المستقل + منع الاتصال الوهمي",
+                                text = "تطبيق بروكسي تاير خاص بسيرفرات MC",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "سوكيت خاص للوايفاي وسوكيت خاص لبيانات الهاتف + ZeroTier مع قطع فوري عند الإيقاف",
+                                text = "ربط مباشر مع سوكيت مستقل للوايفاي وسوكيت مستقل لبيانات الهاتف + ZeroTier",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontSize = 11.sp,
                                 color = EmeraldTunnel
@@ -618,7 +619,6 @@ private fun StandaloneProxyAndPageTab(
                     }
                 }
 
-                // Active Socket Channel Status Pill
                 Surface(
                     color = CyberSurface,
                     shape = RoundedCornerShape(10.dp),
@@ -651,7 +651,6 @@ private fun StandaloneProxyAndPageTab(
                     }
                 }
 
-                // Built-in Anti-Block Fast DNS (YemenNet Bypass & Page Speedup)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -684,7 +683,6 @@ private fun StandaloneProxyAndPageTab(
             }
         }
 
-        // Card 2: Saved Proxies List (قائمة البروكسيات المحفوظة مع أزرار التشغيل/الإيقاف والتعديل والحفظ)
         Surface(
             color = CyberCard,
             shape = RoundedCornerShape(16.dp),
@@ -778,7 +776,6 @@ private fun StandaloneProxyAndPageTab(
             }
         }
 
-        // Card 3: Add New Proxy / Edit Existing Proxy Card (All fields empty by default!)
         Surface(
             color = CyberCard,
             shape = RoundedCornerShape(16.dp),
@@ -1114,7 +1111,6 @@ private fun StandaloneProxyAndPageTab(
             }
         }
 
-        // Card 4: Quick Page / MikroTik Opener Card (Completely empty input box with no example IP!)
         Surface(
             color = CyberCard,
             shape = RoundedCornerShape(16.dp),
@@ -1235,7 +1231,6 @@ private fun StandaloneProxyAndPageTab(
             }
         }
 
-        // Scrollable bottom space inside the scroll content so any field can scroll to the top of the screen
         Spacer(modifier = Modifier.height(340.dp))
     }
 }

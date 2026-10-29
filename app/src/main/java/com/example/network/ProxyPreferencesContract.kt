@@ -1,8 +1,5 @@
 package com.example.network
 
-/**
- * واجهة مستقلة خاصة بحفظ واسترجاع إعدادات البروكسيات والايبيات المحفوظة (Preferences Contract).
- */
 interface ProxyPreferencesContract {
     fun loadSavedRouterIps(): List<SavedRouterIpEntry>
     fun saveRouterIpsList(ips: List<SavedRouterIpEntry>)
